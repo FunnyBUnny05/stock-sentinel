@@ -1,35 +1,31 @@
-import { SetupForm } from './components/setup-form';
-import { SetupList } from './components/setup-list';
+
+import { CommandBar } from './components/command-bar';
+import { IntelGrid } from './components/intel-grid';
 
 export default function Home() {
     return (
-        <main className="min-h-screen p-6 md:p-8 max-w-7xl mx-auto pt-8">
-
-            {/* Zone 1: Command Input */}
-            <section className="mb-12">
-                <div className="flex items-center gap-2 mb-2">
-                    <div className="w-1 h-4 bg-blue-500"></div>
-                    <h2 className="text-sm font-mono text-blue-400 tracking-widest uppercase">
-                        COMMAND_INPUT
-                    </h2>
-                </div>
-                <SetupForm />
-            </section>
+        <main className="min-h-screen p-6 md:p-8 max-w-7xl mx-auto pt-8 pb-32">
+            <CommandBar />
 
             {/* Zone 2: Surveillance Grid */}
             <section>
-                <div className="flex items-center justify-between mb-6 border-b border-white/10 pb-2">
+                <div className="flex items-center justify-between mb-8 border-b border-white/5 pb-2">
                     <div className="flex items-center gap-2">
-                        <div className="w-1 h-4 bg-green-500"></div>
-                        <h2 className="text-sm font-mono text-green-400 tracking-widest uppercase">
-                            ACTIVE_SURVEILLANCE
+                        <div className="w-1 h-4 bg-green-500 shadow-[0_0_8px_#22c55e]"></div>
+                        <h2 className="text-sm font-mono text-green-400 tracking-[0.2em] uppercase font-bold">
+                            ACTIVE_INTEL_GRID
                         </h2>
                     </div>
-                    <div className="text-[10px] font-mono text-gray-600">
-                // SECURE_CONNECTION
+                    <div className="flex items-center gap-4 text-[10px] font-mono text-gray-600">
+                        <div className="flex items-center gap-1.5">
+                            <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+                            <span>LIVE_FEED</span>
+                        </div>
+                        <span>SECURE_UPLINK</span>
                     </div>
                 </div>
-                <SetupList />
+
+                <IntelGrid />
             </section>
         </main>
     );
