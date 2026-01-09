@@ -143,27 +143,20 @@ export function MarginDashboard() {
             setError(null);
 
             const loadMarginLive = async () => {
-                const { promise, controller } = fetchWithTimeout('https://www.finra.org/sites/default/files/Industry_Margin_Statistics.csv');
-                marginController = controller;
+                // Use our server-side API route to avoid CORS issues
+                const res = await fetch('/api/margin-data');
+                const json = await res.json();
 
-                let res;
-                try {
-                    res = await promise;
-                } catch (err: unknown) {
-                    if (err instanceof Error && err.name === 'AbortError') throw new Error('FINRA margin request timed out');
-                    throw err;
+                if (!json.success || !json.data?.length) {
+                    throw new Error(json.error || 'Failed to fetch live margin data');
                 }
 
-                if (!res.ok) throw new Error('Failed to reach FINRA margin CSV');
-                const text = await res.text();
-                const parsed = parseFinraMarginCsv(text);
-                if (!parsed.length) throw new Error('No margin data parsed from FINRA');
                 if (!cancelled) {
-                    setRawData(parsed);
+                    setRawData(json.data);
                     setMetadata({
-                        lastUpdated: parsed[parsed.length - 1]?.date,
-                        source: 'FINRA Margin Statistics (live)',
-                        sourceUrl: 'https://www.finra.org/rules-guidance/key-topics/margin-accounts/margin-statistics'
+                        lastUpdated: json.last_updated,
+                        source: json.source,
+                        sourceUrl: json.source_url
                     });
                 }
             };
