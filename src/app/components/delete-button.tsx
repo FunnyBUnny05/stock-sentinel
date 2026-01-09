@@ -10,7 +10,9 @@ export function DeleteButton({ id }: { id: string }) {
         <button
             onClick={() => {
                 if (confirm('CONFIRM DELETION PROTOCOL?')) {
-                    startTransition(() => deleteSetup(id));
+                    startTransition(() => {
+                        deleteSetup(id);
+                    });
                 }
             }}
             disabled={isPending}
