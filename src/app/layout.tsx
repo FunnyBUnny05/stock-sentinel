@@ -1,6 +1,6 @@
+
 import type { Metadata } from "next";
 import { Inter, Orbitron, JetBrains_Mono } from "next/font/google"; // Added JetBrains Mono
-import { Header } from "./components/header"; // Import Header
 import "./globals.css";
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
@@ -20,7 +20,6 @@ export default function RootLayout({
     return (
         <html lang="en">
             <body className={`${inter.variable} ${orbitron.variable} ${mono.variable} font-sans antialiased min-h-screen bg-grid selection:bg-blue-500/30 selection:text-blue-200 pt-14`}>
-                <Header />
                 {children}
             </body>
         </html>
