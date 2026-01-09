@@ -1,0 +1,24 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model StockSetup {
+  id                String   @id @default(cuid())
+  ticker            String
+  status            String   @default("WAITING") // WAITING, GREEN_LIGHT, INVALIDATED
+  convictionScore   Int      @default(0)
+  analysisMarkdown  String?
+  entryZone         String?
+  stopLoss          Float?
+  targetPrice       Float?
+  lastReviewedAt    DateTime @default(now())
+  createdAt         DateTime @default(now())
+}
