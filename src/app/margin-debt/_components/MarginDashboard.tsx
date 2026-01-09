@@ -1,329 +1,843 @@
 'use client';
 
-import { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Area, ComposedChart } from 'recharts';
 
-type DashboardView = 'FINRA' | 'AAII';
-type TimeRange = '2Y' | '5Y' | '10Y' | 'ALL';
+const formatDate = (date: string) => {
+    if (!date) return '';
+    const [year, month] = date.split('-');
+    return `${month}/${year.slice(2)}`;
+};
+
+interface TooltipPayload {
+    name: string;
+    value: number;
+    color: string;
+    dataKey: string;
+}
+
+const CustomTooltip = ({ active, payload, label }: { active?: boolean; payload?: TooltipPayload[]; label?: string }) => {
+    if (active && payload && payload.length) {
+        const formatValue = (p: TooltipPayload) => {
+            if (p.name === 'YoY Growth') return `${p.value?.toFixed(1)}%`;
+            if (p.dataKey === 'margin_debt_bn') return `$${p.value?.toFixed(0)}B`;
+            return p.value;
+        };
+
+        return (
+            <div style={{ background: '#1a1a2e', border: '1px solid #444', padding: '10px', borderRadius: '4px' }}>
+                <p style={{ color: '#fff', margin: 0, fontWeight: 'bold' }}>{label}</p>
+                {payload.map((p, i) => (
+                    <p key={i} style={{ color: p.color, margin: '4px 0 0 0' }}>
+                        {p.name}: {formatValue(p)}
+                    </p>
+                ))}
+            </div>
+        );
+    }
+    return null;
+};
+
+const normalizeMonthKey = (dateStr: string) => {
+    const parsed = new Date(dateStr);
+    if (!isNaN(parsed.getTime())) {
+        return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}`;
+    }
+
+    const parts = dateStr.split(/[-/]/);
+    if (parts.length >= 2) {
+        const [p1, p2] = parts;
+        if (p1.length === 4) {
+            return `${p1}-${p2.padStart(2, '0')}`;
+        }
+        if (p2.length === 4) {
+            return `${p2}-${p1.padStart(2, '0')}`;
+        }
+    }
+
+    return dateStr;
+};
+
+const fetchWithTimeout = (url: string, timeoutMs = 12000) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const promise = fetch(url, { signal: controller.signal })
+        .finally(() => clearTimeout(timer));
+    return { promise, controller };
+};
+
+interface RawMarginData {
+    date: string;
+    margin_debt: number;
+    yoy_growth: number | null;
+}
+
+interface MarginData extends RawMarginData {
+    margin_debt_bn: number;
+}
+
+interface AaiiData {
+    date: string;
+    stocks: number;
+    bonds: number;
+    cash: number;
+}
+
+interface Metadata {
+    lastUpdated: string;
+    source: string;
+    sourceUrl: string;
+}
+
+const parseFinraMarginCsv = (text: string): RawMarginData[] => {
+    const lines = text.trim().split(/\r?\n/).filter(Boolean);
+    if (lines.length < 2) return [];
+
+    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+    const dateIdx = headers.findIndex(h => h.includes('date'));
+    const debtIdx = headers.findIndex(h => h.includes('debit'));
+
+    if (dateIdx === -1 || debtIdx === -1) return [];
+
+    const rows = lines.slice(1)
+        .map(line => line.split(',').map(cell => cell.trim()))
+        .filter(parts => parts.length > Math.max(dateIdx, debtIdx));
+
+    const parsed = rows.map(parts => ({
+        date: normalizeMonthKey(parts[dateIdx]),
+        margin_debt: Number(parts[debtIdx].replace(/,/g, ''))
+    }))
+        .filter(d => d.date && !Number.isNaN(d.margin_debt))
+        .sort((a, b) => a.date.localeCompare(b.date));
+
+    return parsed.map((entry, idx) => {
+        const yearBack = idx >= 12 ? parsed[idx - 12].margin_debt : null;
+        const yoy_growth = yearBack ? ((entry.margin_debt / yearBack - 1) * 100) : null;
+        return { ...entry, yoy_growth: yoy_growth !== null ? Number(yoy_growth.toFixed(1)) : null };
+    });
+};
 
 export function MarginDashboard() {
-    const [view, setView] = useState<DashboardView>('FINRA');
-    const [timeRange, setTimeRange] = useState<TimeRange>('ALL');
+    const [rawData, setRawData] = useState<RawMarginData[]>([]);
+    const [metadata, setMetadata] = useState<Metadata | null>(null);
+    const [aaiiRawData, setAaiiRawData] = useState<AaiiData[]>([]);
+    const [aaiiMetadata, setAaiiMetadata] = useState<Metadata | null>(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [timeRange, setTimeRange] = useState('all');
+    const [dataSource, setDataSource] = useState<'margin' | 'aaii'>('margin');
+    const [isMobile, setIsMobile] = useState(() => typeof window !== 'undefined' && window.innerWidth <= 640);
+
+    useEffect(() => {
+        const handleResize = () => setIsMobile(window.innerWidth <= 640);
+        window.addEventListener('resize', handleResize);
+        return () => window.removeEventListener('resize', handleResize);
+    }, []);
+
+    useEffect(() => {
+        let cancelled = false;
+        let marginController: AbortController | undefined;
+
+        const loadData = async () => {
+            setLoading(true);
+            setError(null);
+
+            const loadMarginLive = async () => {
+                const { promise, controller } = fetchWithTimeout('https://www.finra.org/sites/default/files/Industry_Margin_Statistics.csv');
+                marginController = controller;
+
+                let res;
+                try {
+                    res = await promise;
+                } catch (err: unknown) {
+                    if (err instanceof Error && err.name === 'AbortError') throw new Error('FINRA margin request timed out');
+                    throw err;
+                }
+
+                if (!res.ok) throw new Error('Failed to reach FINRA margin CSV');
+                const text = await res.text();
+                const parsed = parseFinraMarginCsv(text);
+                if (!parsed.length) throw new Error('No margin data parsed from FINRA');
+                if (!cancelled) {
+                    setRawData(parsed);
+                    setMetadata({
+                        lastUpdated: parsed[parsed.length - 1]?.date,
+                        source: 'FINRA Margin Statistics (live)',
+                        sourceUrl: 'https://www.finra.org/rules-guidance/key-topics/margin-accounts/margin-statistics'
+                    });
+                }
+            };
+
+            const loadMarginFallback = async () => {
+                const res = await fetch('/margin_data.json');
+                if (!res.ok) throw new Error('Failed to load local margin data');
+                const json = await res.json();
+                if (!json.data?.length) throw new Error('No margin data in local file');
+                if (!cancelled) {
+                    setRawData(json.data);
+                    setMetadata({
+                        lastUpdated: json.last_updated,
+                        source: json.source + ' (cached)',
+                        sourceUrl: json.source_url
+                    });
+                }
+            };
+
+            const loadAaiiData = async () => {
+                const res = await fetch('/aaii_allocation_data.json');
+                if (!res.ok) throw new Error('Failed to load AAII allocation data');
+                const json = await res.json();
+                if (!json.data?.length) throw new Error('No AAII data in local file');
+                if (!cancelled) {
+                    setAaiiRawData(json.data);
+                    setAaiiMetadata({
+                        lastUpdated: json.last_updated,
+                        source: json.source,
+                        sourceUrl: json.source_url
+                    });
+                }
+            };
+
+            try {
+                await Promise.all([
+                    loadMarginLive().catch(async () => {
+                        await loadMarginFallback().catch((fallbackErr) => {
+                            throw fallbackErr;
+                        });
+                    }),
+                    loadAaiiData().catch(() => {
+                        // AAII data is optional, don't fail if missing
+                    })
+                ]);
+            } catch (err: unknown) {
+                setError(err instanceof Error ? err.message : 'Unable to load data');
+            } finally {
+                if (!cancelled) {
+                    setLoading(false);
+                }
+            }
+        };
+
+        loadData();
+
+        return () => {
+            cancelled = true;
+            marginController?.abort();
+        };
+    }, []);
+
+    if (loading) {
+        return (
+            <div style={{ background: '#0d0d1a', color: '#e0e0e0', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: '24px', marginBottom: '16px' }}>Loading live data...</div>
+                    <div style={{ color: '#888' }}>Fetching FINRA margin statistics</div>
+                </div>
+            </div>
+        );
+    }
+
+    if (error) {
+        return (
+            <div style={{ background: '#0d0d1a', color: '#ef4444', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: '24px', marginBottom: '16px' }}>Error Loading Data</div>
+                    <div>{error}</div>
+                </div>
+            </div>
+        );
+    }
+
+    if (!rawData.length) {
+        return (
+            <div style={{ background: '#0d0d1a', color: '#ef4444', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{ textAlign: 'center' }}>
+                    <div style={{ fontSize: '24px', marginBottom: '16px' }}>Unable to load margin data</div>
+                    <div>No FINRA data available right now.</div>
+                </div>
+            </div>
+        );
+    }
+
+    const data: MarginData[] = rawData.map(d => ({
+        ...d,
+        margin_debt_bn: d.margin_debt / 1000
+    }));
+
+    const filteredData = timeRange === 'all' ? data :
+        timeRange === '10y' ? data.slice(-120) :
+            timeRange === '5y' ? data.slice(-60) : data.slice(-24);
+
+    const chartInterval = Math.floor((filteredData.length || 1) / 8);
+
+    const currentDebt = data[data.length - 1];
+    const peak2021 = data.find(d => d.date === '2021-10') || data[data.length - 1];
+    const peak2000 = data.find(d => d.date === '2000-03') || data[0];
+
+    const formatLastUpdated = (iso: string) => {
+        if (!iso) return 'N/A';
+        const d = new Date(iso);
+        return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+    };
+
+    const formatDuration = (months: number) => {
+        if (months === 0) return 'N/A';
+        const wholeMonths = Math.floor(months);
+        const remainderMonths = months - wholeMonths;
+        const days = Math.round(remainderMonths * 30);
+
+        if (wholeMonths === 0) {
+            return `${days} ${days === 1 ? 'day' : 'days'}`;
+        } else if (days === 0) {
+            return `${wholeMonths} ${wholeMonths === 1 ? 'month' : 'months'}`;
+        } else {
+            return `${wholeMonths} ${wholeMonths === 1 ? 'month' : 'months'}, ${days} ${days === 1 ? 'day' : 'days'}`;
+        }
+    };
+
+    const calculateThresholdStats = (data: MarginData[]) => {
+        const aboveThirty: number[] = [];
+        const belowNegThirty: number[] = [];
+
+        let aboveStart = -1;
+        let aboveCount = 0;
+        let belowStart = -1;
+        let belowCount = 0;
+
+        for (let idx = 0; idx < data.length; idx++) {
+            const point = data[idx];
+            if (point.yoy_growth === null) continue;
+
+            if (point.yoy_growth >= 30) {
+                if (aboveStart === -1) {
+                    aboveStart = idx;
+                    aboveCount = 1;
+                } else {
+                    aboveCount++;
+                }
+            } else {
+                if (aboveStart !== -1) {
+                    aboveThirty.push(aboveCount);
+                    aboveStart = -1;
+                    aboveCount = 0;
+                }
+            }
+
+            if (point.yoy_growth <= -30) {
+                if (belowStart === -1) {
+                    belowStart = idx;
+                    belowCount = 1;
+                } else {
+                    belowCount++;
+                }
+            } else {
+                if (belowStart !== -1) {
+                    belowNegThirty.push(belowCount);
+                    belowStart = -1;
+                    belowCount = 0;
+                }
+            }
+        }
+
+        const latestPoint = data[data.length - 1];
+        let currentStatus: 'neutral' | 'above30' | 'belowNeg30' = 'neutral';
+        let currentDuration = 0;
+
+        if (latestPoint && latestPoint.yoy_growth !== null) {
+            if (latestPoint.yoy_growth >= 30 && aboveStart !== -1) {
+                currentStatus = 'above30';
+                currentDuration = aboveCount;
+            } else if (latestPoint.yoy_growth <= -30 && belowStart !== -1) {
+                currentStatus = 'belowNeg30';
+                currentDuration = belowCount;
+            }
+        }
+
+        const completedAbove = currentStatus === 'above30' ? aboveThirty : [...aboveThirty];
+        const completedBelow = currentStatus === 'belowNeg30' ? belowNegThirty : [...belowNegThirty];
+
+        if (aboveStart !== -1 && currentStatus !== 'above30') completedAbove.push(aboveCount);
+        if (belowStart !== -1 && currentStatus !== 'belowNeg30') completedBelow.push(belowCount);
+
+        const avgAbove = completedAbove.length > 0
+            ? completedAbove.reduce((a, b) => a + b, 0) / completedAbove.length
+            : 0;
+        const avgBelow = completedBelow.length > 0
+            ? completedBelow.reduce((a, b) => a + b, 0) / completedBelow.length
+            : 0;
+
+        return {
+            above30: {
+                avgMonths: avgAbove,
+                occurrences: completedAbove.length,
+                periods: completedAbove
+            },
+            belowNeg30: {
+                avgMonths: avgBelow,
+                occurrences: completedBelow.length,
+                periods: completedBelow
+            },
+            current: {
+                status: currentStatus,
+                duration: currentDuration,
+                yoyGrowth: latestPoint?.yoy_growth
+            }
+        };
+    };
+
+    const thresholdStats = calculateThresholdStats(data);
 
     return (
-        <div className="min-h-screen bg-[#0d0d1a] text-white relative overflow-hidden">
-            {/* Background Glows */}
-            <div
-                className="fixed top-0 left-0 w-[800px] h-[800px] pointer-events-none"
-                style={{ background: 'radial-gradient(circle at 10% 20%, rgba(59, 130, 246, 0.15) 0%, transparent 50%)' }}
-            />
-            <div
-                className="fixed bottom-0 right-0 w-[600px] h-[600px] pointer-events-none"
-                style={{ background: 'radial-gradient(circle at 90% 80%, rgba(239, 68, 68, 0.1) 0%, transparent 50%)' }}
-            />
-
-            <div className="max-w-[1200px] mx-auto p-6 relative z-10">
-                {/* Header */}
-                <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6 mb-8">
-                    <div>
-                        <h1 className="text-2xl md:text-3xl font-bold text-white mb-1">
-                            {view === 'FINRA' ? 'FINRA Margin Debt Tracker' : 'AAII Asset Allocation Survey'}
+        <div style={{ background: '#0d0d1a', color: '#e0e0e0', padding: isMobile ? '16px' : '20px', minHeight: '100vh', fontFamily: 'system-ui' }}>
+            <div style={{ maxWidth: isMobile ? '720px' : '1200px', width: '100%', margin: '0 auto' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: isMobile ? 'center' : 'flex-start', marginBottom: '8px', gap: isMobile ? '12px' : '0', flexDirection: isMobile ? 'column' : 'row', textAlign: isMobile ? 'center' : 'left' }}>
+                    <div style={{ width: '100%' }}>
+                        <h1 style={{ fontSize: '24px', marginBottom: '8px', color: '#fff' }}>
+                            {dataSource === 'margin' ? 'FINRA Margin Debt Tracker' : 'AAII Asset Allocation Survey'}
                         </h1>
-                        <p className="text-gray-400 text-sm">
-                            {view === 'FINRA'
-                                ? 'Track margin debt levels as a contrarian indicator for market euphoria'
-                                : 'Retail investor sentiment and asset allocation trends since 1987'}
+                        <p style={{ color: '#888', marginBottom: '4px' }}>
+                            {dataSource === 'margin' ? 'Securities margin account debit balances ($ billions)' : 'Individual investor asset allocation (%)'}
                         </p>
                     </div>
-
-                    {/* View Toggle */}
-                    <div className="flex bg-[#1a1a2e] rounded-lg p-1">
-                        <button
-                            onClick={() => setView('FINRA')}
-                            className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${view === 'FINRA'
-                                    ? 'bg-red-500 text-white'
-                                    : 'text-gray-400 hover:text-white'
-                                }`}
-                        >
-                            FINRA Margin Debt
-                        </button>
-                        <button
-                            onClick={() => setView('AAII')}
-                            className={`px-4 py-2 rounded-md text-sm font-medium transition-all ${view === 'AAII'
-                                    ? 'bg-blue-500 text-white'
-                                    : 'text-gray-400 hover:text-white'
-                                }`}
-                        >
-                            AAII Allocation
-                        </button>
-                    </div>
+                    {((dataSource === 'margin' && metadata) || (dataSource === 'aaii' && aaiiMetadata)) && (
+                        <div style={{ textAlign: isMobile ? 'center' : 'right', fontSize: '12px', color: '#666', width: '100%' }}>
+                            <div>Last updated: {formatLastUpdated(dataSource === 'margin' ? metadata?.lastUpdated || '' : aaiiMetadata?.lastUpdated || '')}</div>
+                            <a href={dataSource === 'margin' ? metadata?.sourceUrl : aaiiMetadata?.sourceUrl} target="_blank" rel="noopener noreferrer" style={{ color: '#3b82f6' }}>
+                                Source: {dataSource === 'margin' ? metadata?.source : aaiiMetadata?.source}
+                            </a>
+                        </div>
+                    )}
                 </div>
 
-                {/* Time Range Buttons */}
-                <div className="flex gap-2 mb-6 flex-wrap">
-                    {(['2Y', '5Y', '10Y', 'ALL'] as TimeRange[]).map(range => (
+                <div style={{ display: 'flex', gap: '12px', marginBottom: '16px', flexWrap: 'wrap', justifyContent: isMobile ? 'center' : 'flex-start' }}>
+                    <button
+                        onClick={() => setDataSource('margin')}
+                        style={{
+                            padding: '8px 20px',
+                            background: dataSource === 'margin' ? '#ef4444' : '#1a1a2e',
+                            color: '#fff',
+                            border: 'none',
+                            borderRadius: '6px',
+                            cursor: 'pointer',
+                            fontWeight: 'bold'
+                        }}
+                    >
+                        FINRA Margin Debt
+                    </button>
+                    <button
+                        onClick={() => setDataSource('aaii')}
+                        style={{
+                            padding: '8px 20px',
+                            background: dataSource === 'aaii' ? '#3b82f6' : '#1a1a2e',
+                            color: '#fff',
+                            border: 'none',
+                            borderRadius: '6px',
+                            cursor: 'pointer',
+                            fontWeight: 'bold'
+                        }}
+                    >
+                        AAII Allocation
+                    </button>
+                </div>
+
+                <div style={{ display: 'flex', gap: '8px', marginBottom: '20px', flexWrap: 'wrap', justifyContent: isMobile ? 'center' : 'flex-start' }}>
+                    {(['2y', '5y', '10y', 'all'] as const).map(range => (
                         <button
                             key={range}
                             onClick={() => setTimeRange(range)}
-                            className={`px-4 py-1.5 rounded text-xs font-medium transition-all ${timeRange === range
-                                    ? 'bg-blue-600 text-white'
-                                    : 'bg-[#1a1a2e] text-gray-400 hover:text-white'
-                                }`}
+                            style={{
+                                padding: '6px 16px',
+                                background: timeRange === range ? '#3b82f6' : '#1a1a2e',
+                                color: '#fff',
+                                border: 'none',
+                                borderRadius: '4px',
+                                cursor: 'pointer'
+                            }}
                         >
-                            {range}
+                            {range.toUpperCase()}
                         </button>
                     ))}
                 </div>
 
-                {view === 'FINRA' ? <FINRAView /> : <AAIIView />}
+                {dataSource === 'margin' && (
+                    <div style={{ display: 'grid', gridTemplateColumns: isMobile ? 'repeat(2, minmax(0, 1fr))' : 'repeat(4, 1fr)', gap: '16px', marginBottom: '24px', textAlign: isMobile ? 'center' : 'left' }}>
+                        <div style={{ background: '#1a1a2e', padding: '16px', borderRadius: '8px' }}>
+                            <div style={{ color: '#888', fontSize: '12px' }}>Current ({currentDebt.date})</div>
+                            <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#ef4444' }}>${currentDebt.margin_debt_bn.toFixed(0)}B</div>
+                        </div>
+                        <div style={{ background: '#1a1a2e', padding: '16px', borderRadius: '8px' }}>
+                            <div style={{ color: '#888', fontSize: '12px' }}>YoY Growth</div>
+                            <div style={{ fontSize: '24px', fontWeight: 'bold', color: currentDebt.yoy_growth && currentDebt.yoy_growth > 0 ? '#ef4444' : '#22c55e' }}>
+                                {currentDebt.yoy_growth && currentDebt.yoy_growth > 0 ? '+' : ''}{currentDebt.yoy_growth?.toFixed(1) || 'N/A'}%
+                            </div>
+                        </div>
+                        <div style={{ background: '#1a1a2e', padding: '16px', borderRadius: '8px' }}>
+                            <div style={{ color: '#888', fontSize: '12px' }}>vs 2021 Peak</div>
+                            <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#f59e0b' }}>
+                                {currentDebt.margin_debt >= peak2021.margin_debt ? '+' : ''}{((currentDebt.margin_debt / peak2021.margin_debt - 1) * 100).toFixed(0)}%
+                            </div>
+                        </div>
+                        <div style={{ background: '#1a1a2e', padding: '16px', borderRadius: '8px' }}>
+                            <div style={{ color: '#888', fontSize: '12px' }}>vs 2000 Peak</div>
+                            <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#a855f7' }}>
+                                +{((currentDebt.margin_debt / peak2000.margin_debt - 1) * 100).toFixed(0)}%
+                            </div>
+                        </div>
+                    </div>
+                )}
 
-                {/* Footer */}
-                <div className="mt-12 text-center text-xs text-gray-600">
-                    Data sources: FINRA, AAII Sentiment Survey • Updated Monthly
-                </div>
-            </div>
-        </div>
-    );
-}
+                {dataSource === 'margin' && (
+                    <div style={{ background: '#1a1a2e', borderRadius: '8px', padding: '20px', marginBottom: '24px' }}>
+                        <h2 style={{ fontSize: '16px', marginBottom: '16px', color: '#fff' }}>Margin Debt Over Time</h2>
+                        <ResponsiveContainer width="100%" height={300}>
+                            <ComposedChart data={filteredData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                                <defs>
+                                    <linearGradient id="marginGradient" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="5%" stopColor="#ef4444" stopOpacity={0.3} />
+                                        <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
+                                    </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#333" />
+                                <XAxis
+                                    dataKey="date"
+                                    stroke="#666"
+                                    tick={{ fill: '#888', fontSize: 11 }}
+                                    tickFormatter={formatDate}
+                                    interval={chartInterval}
+                                />
+                                <YAxis
+                                    stroke="#666"
+                                    tick={{ fill: '#888', fontSize: 11 }}
+                                    tickFormatter={(v) => `$${v}B`}
+                                    domain={['auto', 'auto']}
+                                />
+                                <Tooltip content={<CustomTooltip />} />
+                                <Area
+                                    type="monotone"
+                                    dataKey="margin_debt_bn"
+                                    stroke="#ef4444"
+                                    fill="url(#marginGradient)"
+                                    name="Margin Debt"
+                                />
+                                <Line
+                                    type="monotone"
+                                    dataKey="margin_debt_bn"
+                                    stroke="#ef4444"
+                                    strokeWidth={2}
+                                    dot={false}
+                                    name="Margin Debt"
+                                />
+                            </ComposedChart>
+                        </ResponsiveContainer>
+                    </div>
+                )}
 
-function FINRAView() {
-    return (
-        <div className="space-y-6">
-            {/* KPI Cards */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                <div className="bg-[#1a1a2e]/50 backdrop-blur-sm rounded-xl p-5 border border-gray-800/50">
-                    <div className="flex justify-between items-start mb-3">
-                        <span className="text-gray-400 text-xs">Current Margin Debt</span>
-                        <span className="text-[10px] text-gray-500 bg-gray-800 px-2 py-0.5 rounded">2025-11</span>
+                {dataSource === 'margin' && (
+                    <div style={{ background: '#1a1a2e', borderRadius: '8px', padding: '20px' }}>
+                        <h2 style={{ fontSize: '16px', marginBottom: '16px', color: '#fff' }}>Year-over-Year Growth Rate</h2>
+                        <ResponsiveContainer width="100%" height={250}>
+                            <ComposedChart data={filteredData.filter(d => d.yoy_growth !== null)} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#333" />
+                                <XAxis
+                                    dataKey="date"
+                                    stroke="#666"
+                                    tick={{ fill: '#888', fontSize: 11 }}
+                                    tickFormatter={formatDate}
+                                    interval={chartInterval}
+                                />
+                                <YAxis
+                                    stroke="#666"
+                                    tick={{ fill: '#888', fontSize: 11 }}
+                                    tickFormatter={(v) => `${v}%`}
+                                    domain={['auto', 'auto']}
+                                />
+                                <Tooltip content={<CustomTooltip />} />
+                                <ReferenceLine y={0} stroke="#666" strokeWidth={2} />
+                                <ReferenceLine y={30} stroke="#ef4444" strokeDasharray="5 5" strokeOpacity={0.5} />
+                                <ReferenceLine y={-30} stroke="#22c55e" strokeDasharray="5 5" strokeOpacity={0.5} />
+                                <Line
+                                    type="monotone"
+                                    dataKey="yoy_growth"
+                                    stroke="#f59e0b"
+                                    strokeWidth={2}
+                                    dot={false}
+                                    name="YoY Growth"
+                                />
+                            </ComposedChart>
+                        </ResponsiveContainer>
+                        <div style={{ display: 'flex', gap: '24px', marginTop: '12px', fontSize: '12px', color: '#888', flexWrap: 'wrap', justifyContent: isMobile ? 'center' : 'flex-start', textAlign: isMobile ? 'center' : 'left' }}>
+                            <span>🔴 +30% threshold (euphoria zone)</span>
+                            <span>🟢 -30% threshold (capitulation zone)</span>
+                        </div>
                     </div>
-                    <div className="text-3xl font-bold text-red-500 mb-1">$1214B</div>
-                    <div className="text-xs text-gray-500">All-time high territory</div>
-                </div>
-                <div className="bg-[#1a1a2e]/50 backdrop-blur-sm rounded-xl p-5 border border-gray-800/50">
-                    <div className="text-gray-400 text-xs mb-3">YoY Growth Rate</div>
-                    <div className="text-3xl font-bold text-red-500 mb-1">+36.3%</div>
-                    <div className="text-xs text-red-400 font-medium">🔥 Euphoria Zone</div>
-                </div>
-                <div className="bg-[#1a1a2e]/50 backdrop-blur-sm rounded-xl p-5 border border-gray-800/50">
-                    <div className="text-gray-400 text-xs mb-3">vs 2021 Peak ($936B)</div>
-                    <div className="text-3xl font-bold text-amber-500 mb-1">+30%</div>
-                    <div className="text-xs text-gray-500">Above previous cycle high</div>
-                </div>
-                <div className="bg-[#1a1a2e]/50 backdrop-blur-sm rounded-xl p-5 border border-gray-800/50">
-                    <div className="text-gray-400 text-xs mb-3">vs 2000 Peak ($300B)</div>
-                    <div className="text-3xl font-bold text-purple-500 mb-1">+305%</div>
-                    <div className="text-xs text-gray-500">Long-term leverage growth</div>
-                </div>
-            </div>
+                )}
 
-            {/* Charts Row */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                {/* Main Chart - Margin Debt Over Time */}
-                <div className="lg:col-span-2 bg-[#1a1a2e]/50 backdrop-blur-sm rounded-xl p-6 border border-gray-800/50">
-                    <h3 className="text-sm font-medium text-white mb-4">Margin Debt Over Time</h3>
-                    <div className="h-[300px] relative">
-                        <svg className="w-full h-full" preserveAspectRatio="none" viewBox="0 0 100 100">
-                            <defs>
-                                <linearGradient id="redGrad" x1="0" x2="0" y1="0" y2="1">
-                                    <stop offset="0%" stopColor="#ef4444" stopOpacity="0.4" />
-                                    <stop offset="100%" stopColor="#ef4444" stopOpacity="0.05" />
-                                </linearGradient>
-                            </defs>
-                            {/* Smooth curve area fill */}
-                            <path
-                                d="M0,95 C10,93 20,88 30,82 C40,76 50,65 60,50 C70,35 80,25 90,18 C95,14 100,10 100,10 L100,100 L0,100 Z"
-                                fill="url(#redGrad)"
-                            />
-                            {/* Smooth curve line */}
-                            <path
-                                d="M0,95 C10,93 20,88 30,82 C40,76 50,65 60,50 C70,35 80,25 90,18 C95,14 100,10 100,10"
-                                fill="none"
-                                stroke="#ef4444"
-                                strokeWidth="2.5"
-                            />
-                        </svg>
-                        <div className="absolute bottom-0 left-0 text-[10px] text-gray-500">1997</div>
-                        <div className="absolute bottom-0 right-0 text-[10px] text-gray-500">2025</div>
-                        <div className="absolute top-0 right-0 text-[10px] text-gray-500">$1214B</div>
-                        <div className="absolute bottom-0 right-0 -translate-y-6 text-[10px] text-gray-500">$0</div>
+                {dataSource === 'margin' && (
+                    <div style={{ marginTop: '20px', padding: '16px', background: '#1a1a2e', borderRadius: '8px', fontSize: '13px', color: '#888', textAlign: isMobile ? 'center' : 'left' }}>
+                        <strong style={{ color: '#f59e0b' }}>Historical pattern:</strong> Sustained 30%+ YoY margin debt growth has preceded every major market correction.
+                        2000 peak (+80% YoY) → dot-com crash. 2007 peak (+62% YoY) → financial crisis. 2021 peak (+71% YoY) → 2022 bear market.
                     </div>
-                </div>
+                )}
 
-                {/* Growth Rate Chart */}
-                <div className="bg-[#1a1a2e]/50 backdrop-blur-sm rounded-xl p-6 border border-gray-800/50">
-                    <h3 className="text-sm font-medium text-white mb-4">Year-over-Year Growth</h3>
-                    <div className="h-[300px] relative">
-                        <svg className="w-full h-full" preserveAspectRatio="none" viewBox="0 0 100 100">
-                            <defs>
-                                <linearGradient id="orangeGrad" x1="0" x2="0" y1="0" y2="1">
-                                    <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.4" />
-                                    <stop offset="100%" stopColor="#f59e0b" stopOpacity="0.05" />
-                                </linearGradient>
-                            </defs>
-                            {/* Zero line */}
-                            <line x1="0" x2="100" y1="50" y2="50" stroke="#374151" strokeWidth="1" strokeDasharray="4" />
-                            {/* Smooth curve area fill */}
-                            <path
-                                d="M0,30 C10,35 20,60 30,45 C40,30 50,20 60,35 C70,50 80,40 90,25 C95,18 100,22 100,22 L100,50 L0,50 Z"
-                                fill="url(#orangeGrad)"
-                            />
-                            {/* Smooth curve line */}
-                            <path
-                                d="M0,30 C10,35 20,60 30,45 C40,30 50,20 60,35 C70,50 80,40 90,25 C95,18 100,22 100,22"
-                                fill="none"
-                                stroke="#f59e0b"
-                                strokeWidth="2.5"
-                            />
-                        </svg>
-                        <div className="absolute top-0 left-0 text-[10px] text-gray-500">+60%</div>
-                        <div className="absolute top-1/2 left-0 -translate-y-1/2 text-[10px] text-gray-500">0%</div>
-                        <div className="absolute bottom-0 left-0 text-[10px] text-gray-500">-40%</div>
-                    </div>
-                    <div className="text-center text-xs text-gray-500 mt-2">Monthly YoY %</div>
-                </div>
-            </div>
+                {dataSource === 'margin' && (
+                    <div style={{ marginTop: '20px', background: '#1a1a2e', borderRadius: '8px', padding: '20px' }}>
+                        <h2 style={{ fontSize: '16px', marginBottom: '16px', color: '#fff' }}>Threshold Duration Statistics</h2>
 
-            {/* Threshold Stats */}
-            <div className="bg-[#1a1a2e]/50 backdrop-blur-sm rounded-xl p-6 border border-gray-800/50">
-                <h3 className="text-sm font-medium text-white mb-4">Threshold Statistics</h3>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-center">
-                    <div>
-                        <div className="text-2xl font-bold text-red-400">4 months</div>
-                        <div className="text-xs text-gray-400 mt-1">Above +30% threshold</div>
-                    </div>
-                    <div>
-                        <div className="text-2xl font-bold text-amber-400">3 months 24 days</div>
-                        <div className="text-xs text-gray-400 mt-1">Average euphoria duration</div>
-                    </div>
-                    <div>
-                        <div className="text-2xl font-bold text-purple-400">12 instances</div>
-                        <div className="text-xs text-gray-400 mt-1">Since 1997</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    );
-}
+                        <div style={{ marginBottom: '20px', padding: '16px', background: thresholdStats.current.status === 'above30' ? '#ef44441a' : thresholdStats.current.status === 'belowNeg30' ? '#22c55e1a' : '#0d0d1a', borderRadius: '8px', border: thresholdStats.current.status === 'above30' ? '2px solid #ef4444' : thresholdStats.current.status === 'belowNeg30' ? '2px solid #22c55e' : '1px solid #333' }}>
+                            <div style={{ fontSize: '14px', fontWeight: 'bold', marginBottom: '8px', color: '#fff' }}>Current Status</div>
+                            {thresholdStats.current.status === 'above30' ? (
+                                <div>
+                                    <div style={{ color: '#ef4444', fontSize: '18px', fontWeight: 'bold', marginBottom: '4px' }}>
+                                        🔴 Above +30% Threshold
+                                    </div>
+                                    <div style={{ color: '#aaa', fontSize: '14px' }}>
+                                        Duration: <span style={{ color: '#fff', fontWeight: 'bold' }}>{formatDuration(thresholdStats.current.duration)}</span>
+                                    </div>
+                                    <div style={{ color: '#888', fontSize: '12px', marginTop: '4px' }}>
+                                        Current YoY Growth: {thresholdStats.current.yoyGrowth?.toFixed(1)}%
+                                    </div>
+                                </div>
+                            ) : thresholdStats.current.status === 'belowNeg30' ? (
+                                <div>
+                                    <div style={{ color: '#22c55e', fontSize: '18px', fontWeight: 'bold', marginBottom: '4px' }}>
+                                        🟢 Below -30% Threshold
+                                    </div>
+                                    <div style={{ color: '#aaa', fontSize: '14px' }}>
+                                        Duration: <span style={{ color: '#fff', fontWeight: 'bold' }}>{formatDuration(thresholdStats.current.duration)}</span>
+                                    </div>
+                                    <div style={{ color: '#888', fontSize: '12px', marginTop: '4px' }}>
+                                        Current YoY Growth: {thresholdStats.current.yoyGrowth?.toFixed(1)}%
+                                    </div>
+                                </div>
+                            ) : (
+                                <div>
+                                    <div style={{ color: '#888', fontSize: '16px' }}>No - Currently in neutral zone</div>
+                                    <div style={{ color: '#666', fontSize: '12px', marginTop: '4px' }}>
+                                        Current YoY Growth: {thresholdStats.current.yoyGrowth?.toFixed(1)}% (between -30% and +30%)
+                                    </div>
+                                </div>
+                            )}
+                        </div>
 
-function AAIIView() {
-    return (
-        <div className="space-y-6">
-            {/* Current Allocation */}
-            <div className="bg-[#1a1a2e]/50 backdrop-blur-sm rounded-xl p-6 border border-gray-800/50">
-                <div className="flex justify-between items-center mb-4">
-                    <h3 className="text-sm font-medium text-white">Current Allocation</h3>
-                    <span className="text-[10px] text-gray-500 bg-gray-800 px-2 py-0.5 rounded">2025-11-01</span>
-                </div>
-                <div className="grid grid-cols-3 gap-6">
-                    <div className="text-center">
-                        <div className="text-4xl font-bold text-blue-500">71.2%</div>
-                        <div className="text-sm text-gray-400 mt-1">Stocks</div>
-                        <div className="text-xs text-gray-500 mt-0.5">Hist. Avg: 62.1%</div>
-                    </div>
-                    <div className="text-center">
-                        <div className="text-4xl font-bold text-yellow-500">14.0%</div>
-                        <div className="text-sm text-gray-400 mt-1">Bonds</div>
-                        <div className="text-xs text-gray-500 mt-0.5">Hist. Avg: 15.9%</div>
-                    </div>
-                    <div className="text-center">
-                        <div className="text-4xl font-bold text-green-500">14.8%</div>
-                        <div className="text-sm text-gray-400 mt-1">Cash</div>
-                        <div className="text-xs text-gray-500 mt-0.5">Hist. Avg: 22.0%</div>
-                    </div>
-                </div>
-            </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(2, 1fr)', gap: '16px' }}>
+                            <div style={{ background: '#0d0d1a', padding: '16px', borderRadius: '8px', border: '1px solid #ef444433' }}>
+                                <div style={{ color: '#ef4444', fontSize: '14px', fontWeight: 'bold', marginBottom: '12px' }}>🔴 Above +30% Threshold (Euphoria)</div>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                        <span style={{ color: '#888', fontSize: '13px' }}>Average duration:</span>
+                                        <span style={{ color: '#fff', fontSize: '18px', fontWeight: 'bold' }}>
+                                            {formatDuration(thresholdStats.above30.avgMonths)}
+                                        </span>
+                                    </div>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                        <span style={{ color: '#888', fontSize: '13px' }}>Number of occurrences:</span>
+                                        <span style={{ color: '#fff', fontSize: '16px' }}>{thresholdStats.above30.occurrences}</span>
+                                    </div>
+                                    {thresholdStats.above30.periods.length > 0 && (
+                                        <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid #333' }}>
+                                            <div style={{ color: '#888', fontSize: '12px', marginBottom: '4px' }}>Duration of each period (months):</div>
+                                            <div style={{ color: '#aaa', fontSize: '12px' }}>
+                                                {thresholdStats.above30.periods.join(', ')}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
 
-            {/* Extremes */}
-            <div className="bg-[#1a1a2e]/50 backdrop-blur-sm rounded-xl p-6 border border-gray-800/50">
-                <h3 className="text-sm font-medium text-white mb-4">Historical Extremes (Since 1987)</h3>
-                <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-center">
-                    <div className="bg-gray-900/50 rounded p-3">
-                        <div className="text-lg font-bold text-blue-400">77.0%</div>
-                        <div className="text-[10px] text-gray-400">Highest Stocks</div>
+                            <div style={{ background: '#0d0d1a', padding: '16px', borderRadius: '8px', border: '1px solid #22c55e33' }}>
+                                <div style={{ color: '#22c55e', fontSize: '14px', fontWeight: 'bold', marginBottom: '12px' }}>🟢 Below -30% Threshold (Capitulation)</div>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                        <span style={{ color: '#888', fontSize: '13px' }}>Average duration:</span>
+                                        <span style={{ color: '#fff', fontSize: '18px', fontWeight: 'bold' }}>
+                                            {formatDuration(thresholdStats.belowNeg30.avgMonths)}
+                                        </span>
+                                    </div>
+                                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                        <span style={{ color: '#888', fontSize: '13px' }}>Number of occurrences:</span>
+                                        <span style={{ color: '#fff', fontSize: '16px' }}>{thresholdStats.belowNeg30.occurrences}</span>
+                                    </div>
+                                    {thresholdStats.belowNeg30.periods.length > 0 && (
+                                        <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid #333' }}>
+                                            <div style={{ color: '#888', fontSize: '12px', marginBottom: '4px' }}>Duration of each period (months):</div>
+                                            <div style={{ color: '#aaa', fontSize: '12px' }}>
+                                                {thresholdStats.belowNeg30.periods.join(', ')}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                        <div style={{ marginTop: '12px', fontSize: '12px', color: '#666', fontStyle: 'italic', textAlign: isMobile ? 'center' : 'left' }}>
+                            Statistics calculated from all available historical data. Each period represents consecutive months where YoY growth remained above/below the threshold.
+                        </div>
                     </div>
-                    <div className="bg-gray-900/50 rounded p-3">
-                        <div className="text-lg font-bold text-blue-700">40.8%</div>
-                        <div className="text-[10px] text-gray-400">Lowest Stocks</div>
-                    </div>
-                    <div className="bg-gray-900/50 rounded p-3">
-                        <div className="text-lg font-bold text-yellow-400">25.5%</div>
-                        <div className="text-[10px] text-gray-400">Highest Bonds</div>
-                    </div>
-                    <div className="bg-gray-900/50 rounded p-3">
-                        <div className="text-lg font-bold text-yellow-700">6.9%</div>
-                        <div className="text-[10px] text-gray-400">Lowest Bonds</div>
-                    </div>
-                    <div className="bg-gray-900/50 rounded p-3">
-                        <div className="text-lg font-bold text-green-400">44.8%</div>
-                        <div className="text-[10px] text-gray-400">Highest Cash</div>
-                    </div>
-                    <div className="bg-gray-900/50 rounded p-3">
-                        <div className="text-lg font-bold text-green-700">11.0%</div>
-                        <div className="text-[10px] text-gray-400">Lowest Cash</div>
-                    </div>
-                </div>
-            </div>
+                )}
 
-            {/* Chart - Asset Allocation Over Time */}
-            <div className="bg-[#1a1a2e]/50 backdrop-blur-sm rounded-xl p-6 border border-gray-800/50">
-                <h3 className="text-sm font-medium text-white mb-4">Asset Allocation Over Time</h3>
-                <div className="h-[300px] relative">
-                    <svg className="w-full h-full" preserveAspectRatio="none" viewBox="0 0 100 100">
-                        <defs>
-                            <linearGradient id="stockGradAAII" x1="0" x2="0" y1="0" y2="1">
-                                <stop offset="0%" stopColor="#3b82f6" stopOpacity="0.3" />
-                                <stop offset="100%" stopColor="#3b82f6" stopOpacity="0.05" />
-                            </linearGradient>
-                            <linearGradient id="bondGradAAII" x1="0" x2="0" y1="0" y2="1">
-                                <stop offset="0%" stopColor="#eab308" stopOpacity="0.3" />
-                                <stop offset="100%" stopColor="#eab308" stopOpacity="0.05" />
-                            </linearGradient>
-                            <linearGradient id="cashGradAAII" x1="0" x2="0" y1="0" y2="1">
-                                <stop offset="0%" stopColor="#22c55e" stopOpacity="0.3" />
-                                <stop offset="100%" stopColor="#22c55e" stopOpacity="0.05" />
-                            </linearGradient>
-                        </defs>
+                {dataSource === 'aaii' && aaiiRawData.length > 0 && (
+                    <>
+                        {(() => {
+                            const aaiiData = aaiiRawData;
+                            const aaiiFilteredData = timeRange === 'all' ? aaiiData :
+                                timeRange === '10y' ? aaiiData.slice(-120) :
+                                    timeRange === '5y' ? aaiiData.slice(-60) : aaiiData.slice(-24);
 
-                        {/* Stocks (Blue) - 40-77% range */}
-                        <path
-                            d="M0,50 C15,52 25,45 40,40 C55,35 70,32 85,28 C95,24 100,20 100,20 L100,100 L0,100 Z"
-                            fill="url(#stockGradAAII)"
-                        />
-                        <path
-                            d="M0,50 C15,52 25,45 40,40 C55,35 70,32 85,28 C95,24 100,20 100,20"
-                            fill="none" stroke="#3b82f6" strokeWidth="2.5"
-                        />
+                            const currentAllocation = aaiiData[aaiiData.length - 1];
+                            const aaiiChartInterval = Math.floor((aaiiFilteredData.length || 1) / 8);
 
-                        {/* Bonds (Yellow/Gold) - 7-25% range */}
-                        <path
-                            d="M0,78 C15,80 25,82 40,80 C55,78 70,82 85,85 C95,86 100,85 100,85 L100,100 L0,100 Z"
-                            fill="url(#bondGradAAII)"
-                        />
-                        <path
-                            d="M0,78 C15,80 25,82 40,80 C55,78 70,82 85,85 C95,86 100,85 100,85"
-                            fill="none" stroke="#eab308" strokeWidth="2.5"
-                        />
+                            const avgStocks = aaiiData.reduce((sum, d) => sum + (d.stocks || 0), 0) / aaiiData.length;
+                            const avgBonds = aaiiData.reduce((sum, d) => sum + (d.bonds || 0), 0) / aaiiData.length;
+                            const avgCash = aaiiData.reduce((sum, d) => sum + (d.cash || 0), 0) / aaiiData.length;
 
-                        {/* Cash (Green) - 11-45% range */}
-                        <path
-                            d="M0,65 C15,60 25,55 40,62 C55,68 70,72 85,78 C95,82 100,85 100,85 L100,100 L0,100 Z"
-                            fill="url(#cashGradAAII)"
-                        />
-                        <path
-                            d="M0,65 C15,60 25,55 40,62 C55,68 70,72 85,78 C95,82 100,85 100,85"
-                            fill="none" stroke="#22c55e" strokeWidth="2.5"
-                        />
-                    </svg>
-                    <div className="absolute bottom-0 left-0 text-[10px] text-gray-500">1987</div>
-                    <div className="absolute bottom-0 right-0 text-[10px] text-gray-500">2025</div>
-                    <div className="absolute top-0 right-0 text-[10px] text-gray-500">80%</div>
-                    <div className="absolute bottom-0 right-0 -translate-y-6 text-[10px] text-gray-500">0%</div>
-                </div>
-                {/* Legend */}
-                <div className="flex justify-center gap-6 mt-4 text-xs">
-                    <div className="flex items-center gap-2"><span className="w-8 h-0.5 bg-blue-500"></span> Stocks</div>
-                    <div className="flex items-center gap-2"><span className="w-8 h-0.5 bg-yellow-500"></span> Bonds</div>
-                    <div className="flex items-center gap-2"><span className="w-8 h-0.5 bg-green-500"></span> Cash</div>
-                </div>
+                            const minStocks = Math.min(...aaiiData.map(d => d.stocks || Infinity));
+                            const maxStocks = Math.max(...aaiiData.map(d => d.stocks || -Infinity));
+                            const minBonds = Math.min(...aaiiData.map(d => d.bonds || Infinity));
+                            const maxBonds = Math.max(...aaiiData.map(d => d.bonds || -Infinity));
+                            const minCash = Math.min(...aaiiData.map(d => d.cash || Infinity));
+                            const maxCash = Math.max(...aaiiData.map(d => d.cash || -Infinity));
+
+                            return (
+                                <>
+                                    <div style={{ display: 'grid', gridTemplateColumns: isMobile ? 'repeat(2, minmax(0, 1fr))' : 'repeat(3, 1fr)', gap: '16px', marginBottom: '16px', textAlign: isMobile ? 'center' : 'left' }}>
+                                        <div style={{ background: '#1a1a2e', padding: '16px', borderRadius: '8px' }}>
+                                            <div style={{ color: '#888', fontSize: '12px' }}>Stocks Allocation ({currentAllocation?.date})</div>
+                                            <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#3b82f6' }}>{currentAllocation?.stocks?.toFixed(1) || 'N/A'}%</div>
+                                        </div>
+                                        <div style={{ background: '#1a1a2e', padding: '16px', borderRadius: '8px' }}>
+                                            <div style={{ color: '#888', fontSize: '12px' }}>Bonds Allocation</div>
+                                            <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#f59e0b' }}>{currentAllocation?.bonds?.toFixed(1) || 'N/A'}%</div>
+                                        </div>
+                                        <div style={{ background: '#1a1a2e', padding: '16px', borderRadius: '8px' }}>
+                                            <div style={{ color: '#888', fontSize: '12px' }}>Cash Allocation</div>
+                                            <div style={{ fontSize: '24px', fontWeight: 'bold', color: '#22c55e' }}>{currentAllocation?.cash?.toFixed(1) || 'N/A'}%</div>
+                                        </div>
+                                    </div>
+
+                                    <div style={{ marginBottom: '24px' }}>
+                                        <h3 style={{ fontSize: '14px', color: '#888', marginBottom: '12px', textAlign: isMobile ? 'center' : 'left' }}>Historical Average (Since 1987)</h3>
+                                        <div style={{ display: 'grid', gridTemplateColumns: isMobile ? 'repeat(2, minmax(0, 1fr))' : 'repeat(3, 1fr)', gap: '16px', textAlign: isMobile ? 'center' : 'left' }}>
+                                            <div style={{ background: '#0d0d1a', padding: '16px', borderRadius: '8px', border: '1px solid #3b82f633' }}>
+                                                <div style={{ color: '#888', fontSize: '12px' }}>Avg Stocks</div>
+                                                <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#3b82f6' }}>{avgStocks.toFixed(1)}%</div>
+                                            </div>
+                                            <div style={{ background: '#0d0d1a', padding: '16px', borderRadius: '8px', border: '1px solid #f59e0b33' }}>
+                                                <div style={{ color: '#888', fontSize: '12px' }}>Avg Bonds</div>
+                                                <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#f59e0b' }}>{avgBonds.toFixed(1)}%</div>
+                                            </div>
+                                            <div style={{ background: '#0d0d1a', padding: '16px', borderRadius: '8px', border: '1px solid #22c55e33' }}>
+                                                <div style={{ color: '#888', fontSize: '12px' }}>Avg Cash</div>
+                                                <div style={{ fontSize: '20px', fontWeight: 'bold', color: '#22c55e' }}>{avgCash.toFixed(1)}%</div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div style={{ marginBottom: '24px' }}>
+                                        <h3 style={{ fontSize: '14px', color: '#888', marginBottom: '12px', textAlign: isMobile ? 'center' : 'left' }}>Historical Extremes</h3>
+                                        <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(2, 1fr)', gap: '16px' }}>
+                                            <div>
+                                                <h4 style={{ fontSize: '12px', color: '#666', marginBottom: '8px', textAlign: isMobile ? 'center' : 'left' }}>Lowest Allocations</h4>
+                                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', textAlign: 'center' }}>
+                                                    <div style={{ background: '#0d0d1a', padding: '12px', borderRadius: '8px', border: '1px solid #3b82f622' }}>
+                                                        <div style={{ color: '#888', fontSize: '11px' }}>Stocks</div>
+                                                        <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#3b82f6' }}>{minStocks.toFixed(1)}%</div>
+                                                    </div>
+                                                    <div style={{ background: '#0d0d1a', padding: '12px', borderRadius: '8px', border: '1px solid #f59e0b22' }}>
+                                                        <div style={{ color: '#888', fontSize: '11px' }}>Bonds</div>
+                                                        <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f59e0b' }}>{minBonds.toFixed(1)}%</div>
+                                                    </div>
+                                                    <div style={{ background: '#0d0d1a', padding: '12px', borderRadius: '8px', border: '1px solid #22c55e22' }}>
+                                                        <div style={{ color: '#888', fontSize: '11px' }}>Cash</div>
+                                                        <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#22c55e' }}>{minCash.toFixed(1)}%</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <h4 style={{ fontSize: '12px', color: '#666', marginBottom: '8px', textAlign: isMobile ? 'center' : 'left' }}>Highest Allocations</h4>
+                                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', textAlign: 'center' }}>
+                                                    <div style={{ background: '#0d0d1a', padding: '12px', borderRadius: '8px', border: '1px solid #3b82f622' }}>
+                                                        <div style={{ color: '#888', fontSize: '11px' }}>Stocks</div>
+                                                        <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#3b82f6' }}>{maxStocks.toFixed(1)}%</div>
+                                                    </div>
+                                                    <div style={{ background: '#0d0d1a', padding: '12px', borderRadius: '8px', border: '1px solid #f59e0b22' }}>
+                                                        <div style={{ color: '#888', fontSize: '11px' }}>Bonds</div>
+                                                        <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#f59e0b' }}>{maxBonds.toFixed(1)}%</div>
+                                                    </div>
+                                                    <div style={{ background: '#0d0d1a', padding: '12px', borderRadius: '8px', border: '1px solid #22c55e22' }}>
+                                                        <div style={{ color: '#888', fontSize: '11px' }}>Cash</div>
+                                                        <div style={{ fontSize: '18px', fontWeight: 'bold', color: '#22c55e' }}>{maxCash.toFixed(1)}%</div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <div style={{ background: '#1a1a2e', borderRadius: '8px', padding: '20px', marginBottom: '24px' }}>
+                                        <h2 style={{ fontSize: '16px', marginBottom: '16px', color: '#fff' }}>Asset Allocation Over Time</h2>
+                                        <ResponsiveContainer width="100%" height={350}>
+                                            <ComposedChart data={aaiiFilteredData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                                                <defs>
+                                                    <linearGradient id="stocksGradient" x1="0" y1="0" x2="0" y2="1">
+                                                        <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.3} />
+                                                        <stop offset="95%" stopColor="#3b82f6" stopOpacity={0} />
+                                                    </linearGradient>
+                                                    <linearGradient id="bondsGradient" x1="0" y1="0" x2="0" y2="1">
+                                                        <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.3} />
+                                                        <stop offset="95%" stopColor="#f59e0b" stopOpacity={0} />
+                                                    </linearGradient>
+                                                    <linearGradient id="cashGradient" x1="0" y1="0" x2="0" y2="1">
+                                                        <stop offset="5%" stopColor="#22c55e" stopOpacity={0.3} />
+                                                        <stop offset="95%" stopColor="#22c55e" stopOpacity={0} />
+                                                    </linearGradient>
+                                                </defs>
+                                                <CartesianGrid strokeDasharray="3 3" stroke="#333" />
+                                                <XAxis
+                                                    dataKey="date"
+                                                    stroke="#666"
+                                                    tick={{ fill: '#888', fontSize: 11 }}
+                                                    tickFormatter={formatDate}
+                                                    interval={aaiiChartInterval}
+                                                />
+                                                <YAxis
+                                                    stroke="#666"
+                                                    tick={{ fill: '#888', fontSize: 11 }}
+                                                    tickFormatter={(v) => `${v}%`}
+                                                    domain={[0, 100]}
+                                                />
+                                                <Tooltip content={<CustomTooltip />} />
+                                                <Area
+                                                    type="monotone"
+                                                    dataKey="stocks"
+                                                    stroke="#3b82f6"
+                                                    fill="url(#stocksGradient)"
+                                                    name="Stocks"
+                                                />
+                                                <Area
+                                                    type="monotone"
+                                                    dataKey="bonds"
+                                                    stroke="#f59e0b"
+                                                    fill="url(#bondsGradient)"
+                                                    name="Bonds"
+                                                />
+                                                <Area
+                                                    type="monotone"
+                                                    dataKey="cash"
+                                                    stroke="#22c55e"
+                                                    fill="url(#cashGradient)"
+                                                    name="Cash"
+                                                />
+                                            </ComposedChart>
+                                        </ResponsiveContainer>
+                                        <div style={{ display: 'flex', gap: '24px', marginTop: '12px', fontSize: '12px', color: '#888', flexWrap: 'wrap', justifyContent: isMobile ? 'center' : 'flex-start', textAlign: isMobile ? 'center' : 'left' }}>
+                                            <span style={{ color: '#3b82f6' }}>● Stocks</span>
+                                            <span style={{ color: '#f59e0b' }}>● Bonds</span>
+                                            <span style={{ color: '#22c55e' }}>● Cash</span>
+                                        </div>
+                                    </div>
+                                </>
+                            );
+                        })()}
+                    </>
+                )}
             </div>
         </div>
     );
