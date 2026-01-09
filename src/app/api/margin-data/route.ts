@@ -1,7 +1,14 @@
 import { NextResponse } from 'next/server';
+import * as XLSX from 'xlsx';
 
 // Normalize date format to YYYY-MM
 function normalizeMonthKey(dateStr: string): string {
+    // Handle Excel date serial numbers
+    if (typeof dateStr === 'number') {
+        const date = XLSX.SSF.parse_date_code(dateStr);
+        return `${date.y}-${String(date.m).padStart(2, '0')}`;
+    }
+
     const parsed = new Date(dateStr);
     if (!isNaN(parsed.getTime())) {
         return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}`;
@@ -21,28 +28,65 @@ function normalizeMonthKey(dateStr: string): string {
     return dateStr;
 }
 
-// Parse FINRA CSV data
-function parseFinraMarginCsv(text: string) {
-    const lines = text.trim().split(/\r?\n/).filter(Boolean);
-    if (lines.length < 2) return [];
+interface RawRow {
+    [key: string]: string | number | undefined;
+}
 
-    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
-    const dateIdx = headers.findIndex(h => h.includes('date'));
-    const debtIdx = headers.findIndex(h => h.includes('debit'));
+// Parse FINRA Excel data
+function parseFinraExcel(buffer: ArrayBuffer) {
+    const workbook = XLSX.read(buffer, { type: 'array' });
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    const jsonData: RawRow[] = XLSX.utils.sheet_to_json(worksheet);
 
-    if (dateIdx === -1 || debtIdx === -1) return [];
+    if (!jsonData.length) return [];
 
-    const rows = lines.slice(1)
-        .map(line => line.split(',').map(cell => cell.trim()))
-        .filter(parts => parts.length > Math.max(dateIdx, debtIdx));
+    // Find the columns for date and debit balance
+    const firstRow = jsonData[0];
+    let dateKey = '';
+    let debitKey = '';
 
-    const parsed = rows.map(parts => ({
-        date: normalizeMonthKey(parts[dateIdx]),
-        margin_debt: Number(parts[debtIdx].replace(/,/g, ''))
-    }))
-        .filter(d => d.date && !Number.isNaN(d.margin_debt))
+    for (const key of Object.keys(firstRow)) {
+        const lowerKey = key.toLowerCase();
+        if (lowerKey.includes('date') || lowerKey.includes('month') || lowerKey.includes('end of month')) {
+            dateKey = key;
+        }
+        if (lowerKey.includes('debit') || lowerKey.includes('margin')) {
+            debitKey = key;
+        }
+    }
+
+    if (!dateKey || !debitKey) {
+        // Try alternative column detection
+        const keys = Object.keys(firstRow);
+        if (keys.length >= 2) {
+            dateKey = keys[0]; // First column is usually date
+            debitKey = keys[1]; // Second column is usually debit balance
+        }
+    }
+
+    if (!dateKey || !debitKey) return [];
+
+    const parsed = jsonData
+        .map(row => {
+            const dateRaw = row[dateKey];
+            const debitRaw = row[debitKey];
+
+            if (!dateRaw || !debitRaw) return null;
+
+            const date = normalizeMonthKey(String(dateRaw));
+            const margin_debt = typeof debitRaw === 'number'
+                ? debitRaw
+                : Number(String(debitRaw).replace(/[$,]/g, ''));
+
+            if (!date || isNaN(margin_debt)) return null;
+
+            return { date, margin_debt };
+        })
+        .filter((d): d is { date: string; margin_debt: number } => d !== null)
         .sort((a, b) => a.date.localeCompare(b.date));
 
+    // Calculate YoY growth
     return parsed.map((entry, idx) => {
         const yearBack = idx >= 12 ? parsed[idx - 12].margin_debt : null;
         const yoy_growth = yearBack ? ((entry.margin_debt / yearBack - 1) * 100) : null;
@@ -52,12 +96,12 @@ function parseFinraMarginCsv(text: string) {
 
 export async function GET() {
     try {
-        // Fetch live data from FINRA
+        // Fetch live data from FINRA Excel file
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 15000);
+        const timeoutId = setTimeout(() => controller.abort(), 20000);
 
         const response = await fetch(
-            'https://www.finra.org/sites/default/files/Industry_Margin_Statistics.csv',
+            'https://www.finra.org/sites/default/files/2021-03/margin-statistics.xlsx',
             {
                 signal: controller.signal,
                 headers: {
@@ -72,11 +116,11 @@ export async function GET() {
             throw new Error(`FINRA responded with status: ${response.status}`);
         }
 
-        const csvText = await response.text();
-        const data = parseFinraMarginCsv(csvText);
+        const buffer = await response.arrayBuffer();
+        const data = parseFinraExcel(buffer);
 
         if (!data.length) {
-            throw new Error('No data parsed from FINRA CSV');
+            throw new Error('No data parsed from FINRA Excel');
         }
 
         return NextResponse.json({
